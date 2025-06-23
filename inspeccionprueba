@@ -1,0 +1,2140 @@
+import sys
+import os
+import json
+import zipfile
+import shutil
+import tempfile
+from datetime import datetime, timedelta
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, Float
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, 
+                             QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, 
+                             QPushButton, QComboBox, QLineEdit, QTextEdit,
+                             QScrollArea, QFrame, QMessageBox, QDialog,
+                             QDialogButtonBox, QDateTimeEdit, QProgressBar,
+                             QRadioButton, QButtonGroup, QFileDialog, QListWidget,
+                             QListWidgetItem, QSplitter, QGroupBox, QCheckBox)
+from PyQt6.QtCore import Qt, QDateTime, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont, QPalette, QColor, QPixmap
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
+
+Base = declarative_base()
+class NuevaEntregaDialog(QDialog):
+    """Dialog para crear inspección de entrega"""
+    
+    def __init__(self, caex, db_manager, parent=None):
+        super().__init__(parent)
+        self.caex = caex
+        self.db_manager = db_manager
+        self.setupUI()
+        
+    def setupUI(self):
+        self.setWindowTitle("Nueva Inspección de Entrega")
+        self.setModal(True)
+        self.resize(450, 300)
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        titulo = QLabel("Nueva Inspección de Entrega")
+        titulo.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        titulo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        titulo.setStyleSheet("color: #28a745; margin: 10px;")
+        layout.addWidget(titulo)
+        
+        # CAEX (fijo)
+        caex_info = QLabel(f"CAEX: {self.caex.id} - {self.caex.modelo}")
+        caex_info.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        caex_info.setStyleSheet("background-color: #f0f0f0; padding: 10px; border-radius: 5px;")
+        layout.addWidget(caex_info)
+        
+        # Inspector
+        layout.addWidget(QLabel("Inspector:"))
+        self.inspector_edit = QLineEdit()
+        layout.addWidget(self.inspector_edit)
+        
+        # Supervisor
+        layout.addWidget(QLabel("Supervisor de Taller:"))
+        self.supervisor_edit = QLineEdit()
+        layout.addWidget(self.supervisor_edit)
+        
+        # Fecha y hora de inicio
+        layout.addWidget(QLabel("Fecha y Hora de Inicio:"))
+        self.datetime_edit = QDateTimeEdit()
+        self.datetime_edit.setDateTime(QDateTime.currentDateTime())
+        layout.addWidget(self.datetime_edit)
+        
+        # Botones
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | 
+                                  QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setLayout(layout)
+    
+    def on_accept(self):
+        """Maneja el botón OK con validación"""
+        try:
+            print("Dialog aceptado, validando campos...")
+            print(f"Inspector: '{self.inspector_edit.text()}'")
+            print(f"Supervisor: '{self.supervisor_edit.text()}'")
+            print(f"CAEX seleccionado: {self.caex_combo.currentData()}")
+            
+            # Validación básica antes de cerrar
+            if not self.inspector_edit.text().strip():
+                QMessageBox.warning(self, "Error", "Debe ingresar el nombre del inspector")
+                return
+                
+            if not self.supervisor_edit.text().strip():
+                QMessageBox.warning(self, "Error", "Debe ingresar el nombre del supervisor")
+                return
+                
+            if self.caex_combo.currentData() is None:
+                QMessageBox.warning(self, "Error", "Debe seleccionar un CAEX válido")
+                return
+            
+            print("Validación exitosa, cerrando dialog...")
+            self.accept()
+            
+        except Exception as e:
+            print(f"Error en on_accept: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Error al validar datos:\n{str(e)}")
+    
+    def get_data(self):
+        """Retorna datos del formulario"""
+        try:
+            # Obtener fecha - manejar diferentes métodos de PyQt6
+            try:
+                fecha_inicio = self.datetime_edit.dateTime().toPython()
+            except AttributeError:
+                try:
+                    fecha_inicio = self.datetime_edit.dateTime().toPyDateTime()
+                except AttributeError:
+                    # Fallback: crear datetime manualmente
+                    dt = self.datetime_edit.dateTime()
+                    fecha_inicio = datetime(dt.date().year(), dt.date().month(), dt.date().day(),
+                                          dt.time().hour(), dt.time().minute(), dt.time().second())
+            
+            return {
+                'tipo': 'ENTREGA',
+                'caex_id': self.caex.id,
+                'inspector': self.inspector_edit.text().strip(),
+                'supervisor': self.supervisor_edit.text().strip(),
+                'fecha_inicio': fecha_inicio,
+                'fecha_estimada': None
+            }
+        except Exception as e:
+            print(f"Error en get_data (entrega): {e}")
+            return {
+                'tipo': 'ENTREGA',
+                'caex_id': self.caex.id,
+                'inspector': '',
+                'supervisor': '',
+                'fecha_inicio': datetime.now(),
+                'fecha_estimada': None
+            }
+# =========================== MODELOS DE DATOS ===========================
+class CAEX(Base):
+    __tablename__ = 'caex'
+    
+    id = Column(Integer, primary_key=True)
+    modelo = Column(String(10), nullable=False)  # '797F' o '798AC'
+    fecha_registro = Column(DateTime, default=datetime.now)
+    
+    # Relaciones
+    inspecciones = relationship("Inspeccion", back_populates="caex")
+    
+    def __init__(self, id, modelo):
+        self.id = id
+        self.modelo = modelo
+        
+    @property
+    def porcentaje_conformidad(self):
+        """Calcula porcentaje acumulativo de conformidad"""
+        if not self.inspecciones:
+            return 100
+        
+        total_respuestas = 0
+        conformes = 0
+        
+        for inspeccion in self.inspecciones:
+            if inspeccion.estado == 'CERRADA':
+                for respuesta in inspeccion.respuestas:
+                    total_respuestas += 1
+                    if respuesta.estado in ['CONFORME', 'ACEPTADO']:
+                        conformes += 1
+        
+        return (conformes / total_respuestas * 100) if total_respuestas > 0 else 100
+
+    @property
+    def estado_actual(self):
+        """Determina el estado actual del CAEX"""
+        inspecciones_abiertas = [i for i in self.inspecciones if i.estado == 'ABIERTA']
+        inspecciones_recepcion_cerradas = [i for i in self.inspecciones 
+                                         if i.tipo == 'RECEPCION' and i.estado == 'CERRADA']
+        
+        if inspecciones_abiertas:
+            tipo = inspecciones_abiertas[0].tipo
+            return f"Inspección {tipo.lower()} abierta"
+        elif inspecciones_recepcion_cerradas:
+            # Verificar si tiene entrega
+            tiene_entrega = any(i.tipo == 'ENTREGA' and i.estado == 'CERRADA' 
+                              for i in self.inspecciones)
+            if not tiene_entrega:
+                return "Pendiente de entrega"
+        
+        return "Disponible"
+
+class Categoria(Base):
+    __tablename__ = 'categorias'
+    
+    id = Column(Integer, primary_key=True)
+    nombre = Column(String(100), nullable=False)
+    orden = Column(Integer, nullable=False)
+    modelo_aplicable = Column(String(10), nullable=False)  # 'TODOS', '797F', '798AC'
+    fecha_creacion = Column(DateTime, default=datetime.now)
+    
+    # Relaciones
+    preguntas = relationship("Pregunta", back_populates="categoria", order_by="Pregunta.orden")
+
+class Pregunta(Base):
+    __tablename__ = 'preguntas'
+    
+    id = Column(Integer, primary_key=True)
+    categoria_id = Column(Integer, ForeignKey('categorias.id'), nullable=False)
+    texto = Column(Text, nullable=False)
+    orden = Column(Integer, nullable=False)
+    modelo_aplicable = Column(String(10), nullable=False)  # 'TODOS', '797F', '798AC'
+    fecha_creacion = Column(DateTime, default=datetime.now)
+    
+    # Relaciones
+    categoria = relationship("Categoria", back_populates="preguntas")
+    respuestas = relationship("Respuesta", back_populates="pregunta")
+
+class Inspeccion(Base):
+    __tablename__ = 'inspecciones'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    caex_id = Column(Integer, ForeignKey('caex.id'), nullable=False)
+    tipo = Column(String(20), nullable=False)  # 'RECEPCION' o 'ENTREGA'
+    estado = Column(String(20), default='ABIERTA')  # 'ABIERTA', 'CERRADA'
+    
+    # Datos del inspector
+    nombre_inspector = Column(String(100), nullable=False)
+    nombre_supervisor = Column(String(100), nullable=False)
+    
+    # Fechas
+    fecha_creacion = Column(DateTime, default=datetime.now)
+    fecha_finalizacion = Column(DateTime, nullable=True)
+    fecha_termino_estimada = Column(DateTime, nullable=True)
+    
+    # Comentarios
+    comentarios_generales = Column(Text, default="")
+    
+    # Para inspecciones de entrega
+    inspeccion_recepcion_id = Column(Integer, ForeignKey('inspecciones.id'), nullable=True)
+    
+    # Relaciones
+    caex = relationship("CAEX", back_populates="inspecciones")
+    respuestas = relationship("Respuesta", back_populates="inspeccion")
+    inspeccion_entrega = relationship("Inspeccion", remote_side=[id])
+
+class Respuesta(Base):
+    __tablename__ = 'respuestas'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    inspeccion_id = Column(Integer, ForeignKey('inspecciones.id'), nullable=False)
+    pregunta_id = Column(Integer, ForeignKey('preguntas.id'), nullable=False)
+    estado = Column(String(20), nullable=False)  # 'CONFORME', 'NO_CONFORME', 'ACEPTADO', 'RECHAZADO'
+    comentarios = Column(Text, default="")
+    tipo_accion = Column(String(20), nullable=True)  # 'INMEDIATO', etc.
+    id_aviso_orden_trabajo = Column(String(50), nullable=True)
+    fecha_creacion = Column(DateTime, default=datetime.now)
+    fecha_modificacion = Column(DateTime, default=datetime.now)
+    
+    # Relaciones
+    inspeccion = relationship("Inspeccion", back_populates="respuestas")
+    pregunta = relationship("Pregunta", back_populates="respuestas")
+    fotos = relationship("Foto", back_populates="respuesta")
+    
+    @property
+    def es_hallazgo(self):
+        return self.estado in ['NO_CONFORME', 'RECHAZADO']
+
+class Foto(Base):
+    __tablename__ = 'fotos'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    respuesta_id = Column(Integer, ForeignKey('respuestas.id'), nullable=False)
+    ruta_archivo = Column(String(255), nullable=False)
+    descripcion = Column(Text, default="")
+    fecha_creacion = Column(DateTime, default=datetime.now)
+    
+    # Relaciones
+    respuesta = relationship("Respuesta", back_populates="fotos")
+
+# =========================== GESTOR DE BASE DE DATOS ===========================
+class DatabaseManager:
+    def __init__(self, db_path="inspecciones_caex.db"):
+        self.engine = create_engine(f'sqlite:///{db_path}')
+        Base.metadata.create_all(self.engine)
+        Session = sessionmaker(bind=self.engine)
+        self.session = Session()
+        
+        # Inicializar datos básicos
+        self._inicializar_datos()
+    
+    def _inicializar_datos(self):
+        """Inicializa CAEXs, categorías y preguntas según datos reales"""
+        
+        # Crear CAEXs modelo 797F (301-339, 365-366)
+        for caex_id in list(range(301, 340)) + [365, 366]:
+            if not self.session.query(CAEX).filter_by(id=caex_id).first():
+                caex = CAEX(id=caex_id, modelo='797F')
+                self.session.add(caex)
+        
+        # Crear CAEXs modelo 798AC (340-352)
+        for caex_id in range(340, 353):
+            if not self.session.query(CAEX).filter_by(id=caex_id).first():
+                caex = CAEX(id=caex_id, modelo='798AC')
+                self.session.add(caex)
+        
+        # Categorías reales del sistema
+        categorias_data = [
+            (1, "Condiciones Generales", 1, "TODOS"),
+            (2, "Cabina Operador", 2, "TODOS"),
+            (3, "Sistema de Dirección", 3, "TODOS"),
+            (4, "Sistema de frenos", 4, "TODOS"),
+            (5, "Motor Diesel", 5, "TODOS"),
+            (6, "Sistema de Enfriamiento", 6, "TODOS"),
+            (7, "Suspensiones delanteras", 7, "TODOS"),
+            (8, "Suspensiones traseras", 8, "TODOS"),
+            (9, "Sistema estructural", 9, "TODOS"),
+            (10, "Sistema eléctrico", 10, "798AC"),
+        ]
+        
+        for cat_id, nombre, orden, modelo in categorias_data:
+            if not self.session.query(Categoria).filter_by(id=cat_id).first():
+                categoria = Categoria(id=cat_id, nombre=nombre, orden=orden, modelo_aplicable=modelo)
+                self.session.add(categoria)
+        
+        # Todas las 51 preguntas reales del sistema
+        preguntas_data = [
+            # Condiciones Generales (1-11)
+            (1, "Extintores contra incendio habilitados en plataforma cabina operador y con inspección al día", 1, 1, "TODOS"),
+            (2, "Pulsador parada de emergencia en buen estado", 1, 2, "TODOS"),
+            (3, "Verificar desgaste excesivo y falta de pernos del aro.", 1, 3, "TODOS"),
+            (4, "Inspección visual y al día del sistema AFEX / ANSUR", 1, 4, "TODOS"),
+            (5, "Pasadores de tolva", 1, 5, "TODOS"),
+            (6, "Fugas sistemas hidráulicos puntos calientes (Motor)", 1, 6, "TODOS"),
+            (7, "Números de identificación caex instalados (frontal, trasero)", 1, 7, "TODOS"),
+            (8, "Estanque de combustible sin fugas", 1, 8, "TODOS"),
+            (9, "Estanque de aceite hidráulico sin fugas", 1, 9, "TODOS"),
+            (10, "Sistema engrase llega a todos los puntos", 1, 10, "TODOS"),
+            (11, "Tren de bombas sistema hidráulico sin fugas", 1, 11, "798AC"),
+            
+            # Cabina Operador (12-22)
+            (12, "Panel de alarmas en buen estado", 2, 1, "TODOS"),
+            (13, "Asiento operador y de copiloto en buen estado (chequear cinturón de seguridad en ambos asientos, apoya brazos, riel de desplazamiento, pulmón de aire)", 2, 2, "TODOS"),
+            (14, "Espejos en buen estado, sin rayaduras", 2, 3, "TODOS"),
+            (15, "Revisar bitácora del equipo (dejar registro)", 2, 4, "TODOS"),
+            (16, "Radio musical y parlantes en buen estado", 2, 5, "TODOS"),
+            (17, "Testigo indicador virage funcionando (intermitente)", 2, 6, "TODOS"),
+            (18, "Funcionamiento bocina", 2, 7, "TODOS"),
+            (19, "Funcionamiento limpia parabrisas", 2, 8, "TODOS"),
+            (20, "Funcionamiento alza vidrios", 2, 9, "TODOS"),
+            (21, "Funcionamiento de A/C", 2, 10, "TODOS"),
+            (22, "Parasol en buen estado", 2, 11, "TODOS"),
+            
+            # Sistema de Dirección (23-26)
+            (23, "Barra de dirección en buen estado", 3, 1, "TODOS"),
+            (24, "Fugas de aceite por bombas/cañerías / mangueras / conectores", 3, 2, "TODOS"),
+            (25, "Cilindros de dirección sin fugas de aceite / sin daños", 3, 3, "797F"),
+            (26, "Estado de acumuladores", 3, 4, "798AC"),
+            
+            # Sistema de frenos (27-28)
+            (27, "Fugas de aceite por cañerías / mangueras / conectores", 4, 1, "TODOS"),
+            (28, "Gabinete hidráulico sin fugas de aceite", 4, 2, "TODOS"),
+            
+            # Motor Diesel (29-33)
+            (29, "Fugas de aceite por cañerías / mangueras / conectores", 5, 1, "TODOS"),
+            (30, "Fugas de combustibles por cañerías / mangueras / turbos / carter", 5, 2, "TODOS"),
+            (31, "Mangueras con roce y/o sueltas", 5, 3, "TODOS"),
+            (32, "Cables eléctricos sin roce y ruteados bajo estándar", 5, 4, "TODOS"),
+            (33, "Boquillas sistema AFEX bien direccionadas", 5, 5, "797F"),
+            
+            # Sistema de Enfriamiento (34-39)
+            (34, "Radiador sin obstrucciones ni acumulación de suciedad", 6, 1, "TODOS"),
+            (35, "Sistema de refrigeración sin fugas", 6, 2, "TODOS"),
+            (36, "Niveles de coolant dentro de rango", 6, 3, "TODOS"),
+            (37, "Ventilador funcionando correctamente", 6, 4, "TODOS"),
+            (38, "Termostato operando en rango normal", 6, 5, "TODOS"),
+            (39, "Ducto de ventilación sistema enfriamiento en buen estado", 6, 6, "798AC"),
+            
+            # Suspensiones delanteras (40-41)
+            (40, "Estado de sello protector vástago (altura susp.)", 7, 1, "TODOS"),
+            (41, "Fugas de aceite o grasa", 7, 2, "TODOS"),
+            
+            # Suspensiones traseras (42-44)
+            (42, "Suspensión izquierda con pasador despalzado", 8, 1, "TODOS"),
+            (43, "Suspensión derecha con pasador desplazado", 8, 2, "TODOS"),
+            (44, "Articulaciones lubricadas", 8, 3, "TODOS"),
+            
+            # Sistema estructural (45-48)
+            (45, "Baranda o cadena acceso a escalas emergencia.", 9, 1, "TODOS"),
+            (46, "Barandas plataforma cabina operador", 9, 2, "TODOS"),
+            (47, "Barandas escalera de acceso", 9, 3, "TODOS"),
+            (48, "Escalera de acceso flotante", 9, 4, "TODOS"),
+            
+            # Sistema eléctrico (49-51) - Solo 798AC
+            (49, "Alternador sin fugas o contaminantes", 10, 1, "798AC"),
+            (50, "Gabinetes convertidora con candado", 10, 2, "798AC"),
+            (51, "Estado sistema de parriillas", 10, 3, "798AC"),
+        ]
+        
+        for pregunta_id, texto, cat_id, orden, modelo in preguntas_data:
+            if not self.session.query(Pregunta).filter_by(id=pregunta_id).first():
+                pregunta = Pregunta(id=pregunta_id, texto=texto, categoria_id=cat_id, 
+                                   orden=orden, modelo_aplicable=modelo)
+                self.session.add(pregunta)
+        
+        self.session.commit()
+    
+    def get_caexs_disponibles_recepcion(self):
+        """Retorna CAEXs disponibles para nueva inspección de recepción"""
+        try:
+            print("Buscando CAEXs disponibles para recepción...")
+            # CAEXs que NO tienen inspecciones abiertas
+            caexs = self.session.query(CAEX).filter(
+                ~CAEX.inspecciones.any(Inspeccion.estado == 'ABIERTA')
+            ).order_by(CAEX.id).all()
+            
+            print(f"Total CAEXs sin inspecciones abiertas: {len(caexs)}")
+            for caex in caexs:
+                print(f"  CAEX {caex.id} - {caex.modelo} disponible")
+                
+            return caexs
+        except Exception as e:
+            print(f"Error en get_caexs_disponibles_recepcion: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def get_caexs_disponibles_entrega(self):
+        """Retorna CAEXs que tienen recepción cerrada sin entrega"""
+        return self.session.query(CAEX).filter(
+            CAEX.inspecciones.any(
+                (Inspeccion.tipo == 'RECEPCION') & 
+                (Inspeccion.estado == 'CERRADA') &
+                (~CAEX.inspecciones.any(Inspeccion.tipo == 'ENTREGA'))
+            )
+        ).order_by(CAEX.id).all()
+    
+    def get_inspecciones_abiertas(self):
+        """Retorna inspecciones en estado abierto"""
+        return self.session.query(Inspeccion).filter_by(estado='ABIERTA').order_by(Inspeccion.fecha_creacion.desc()).all()
+    
+    def get_preguntas_para_modelo(self, modelo):
+        """Retorna preguntas aplicables para un modelo específico"""
+        return self.session.query(Pregunta).join(Categoria).filter(
+            (Pregunta.modelo_aplicable.in_(['TODOS', modelo])) &
+            (Categoria.modelo_aplicable.in_(['TODOS', modelo]))
+        ).order_by(Categoria.orden, Pregunta.orden).all()
+    
+    def get_categorias_para_modelo(self, modelo):
+        """Retorna categorías aplicables para un modelo específico"""
+        return self.session.query(Categoria).filter(
+            Categoria.modelo_aplicable.in_(['TODOS', modelo])
+        ).order_by(Categoria.orden).all()
+    
+    def get_historial_pregunta_caex(self, pregunta_id, caex_id):
+        """Retorna historial de hallazgos de una pregunta específica para un CAEX"""
+        return self.session.query(Respuesta).join(Inspeccion).filter(
+            Respuesta.pregunta_id == pregunta_id,
+            Inspeccion.caex_id == caex_id,
+            Respuesta.estado.in_(['NO_CONFORME', 'RECHAZADO'])
+        ).order_by(Respuesta.fecha_creacion.desc()).all()
+    
+    def close(self):
+        self.session.close()
+
+# =========================== WIDGETS PERSONALIZADOS ===========================
+class CAEXCard(QFrame):
+    """Tarjeta individual para mostrar resumen de CAEX"""
+    
+    clicked = pyqtSignal(object)
+    
+    def __init__(self, caex, parent=None):
+        super().__init__(parent)
+        self.caex = caex
+        self.setupUI()
+        
+    def setupUI(self):
+        self.setFrameStyle(QFrame.Shape.Box)
+        self.setStyleSheet("""
+            CAEXCard {
+                border: 2px solid #cccccc;
+                border-radius: 10px;
+                background-color: white;
+                margin: 5px;
+                padding: 10px;
+            }
+            CAEXCard:hover {
+                border-color: #0078d4;
+                background-color: #f0f8ff;
+            }
+        """)
+        
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
+        
+        # Header con ID y modelo
+        header = QHBoxLayout()
+        id_label = QLabel(f"CAEX {self.caex.id}")
+        id_label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        id_label.setStyleSheet("color: #0078d4; background: transparent;")
+        
+        modelo_label = QLabel(f"Modelo: {self.caex.modelo}")
+        modelo_label.setStyleSheet("color: #333333; font-weight: bold; background: transparent;")
+        
+        header.addWidget(id_label)
+        header.addStretch()
+        header.addWidget(modelo_label)
+        
+        # Porcentaje de conformidad
+        conformidad = self.caex.porcentaje_conformidad
+        progress = QProgressBar()
+        progress.setValue(int(conformidad))
+        progress.setFormat(f"Conformidad: {conformidad:.1f}%")
+        progress.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+                text-align: center;
+                color: #000000;
+                font-weight: bold;
+                background-color: #f0f0f0;
+            }
+            QProgressBar::chunk {
+                background-color: #4ecdc4;
+                border-radius: 2px;
+            }
+        """)
+        
+        # Estado actual
+        estado = self.caex.estado_actual
+        estado_label = QLabel(f"Estado: {estado}")
+        color_estado = self.get_color_estado(estado)
+        estado_label.setStyleSheet(f"color: {color_estado}; font-weight: bold; font-size: 11px; background: transparent;")
+        
+        # Total de inspecciones
+        total_inspecciones = len([i for i in self.caex.inspecciones if i.estado == 'CERRADA'])
+        inspecciones_label = QLabel(f"Inspecciones completadas: {total_inspecciones}")
+        inspecciones_label.setStyleSheet("color: #333333; font-size: 10px; background: transparent;")
+        
+        layout.addLayout(header)
+        layout.addWidget(progress)
+        layout.addWidget(estado_label)
+        layout.addWidget(inspecciones_label)
+        
+        self.setLayout(layout)
+        self.setFixedHeight(140)
+        self.setMinimumWidth(300)
+        
+    def get_color_estado(self, estado):
+        """Retorna color según el estado"""
+        if "abierta" in estado:
+            return "#ff6b6b"  # Rojo
+        elif "Pendiente" in estado:
+            return "#ffa500"  # Naranja
+        else:
+            return "#4ecdc4"  # Verde
+    
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.caex)
+
+# =========================== DIALOGS ===========================
+class NuevaInspeccionDialog(QDialog):
+    """Dialog para crear nueva inspección"""
+    
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.setupUI()
+        
+    def setupUI(self):
+        self.setWindowTitle("Nueva Inspección de Recepción")
+        self.setModal(True)
+        self.resize(450, 350)
+        
+        layout = QVBoxLayout()
+        
+        # Título fijo para recepción
+        titulo = QLabel("Nueva Inspección de Recepción")
+        titulo.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        titulo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        titulo.setStyleSheet("color: #0078d4; margin: 10px;")
+        layout.addWidget(titulo)
+        
+        # CAEX
+        layout.addWidget(QLabel("CAEX:"))
+        self.caex_combo = QComboBox()
+        self.load_caexs_disponibles()
+        layout.addWidget(self.caex_combo)
+        
+        # Inspector
+        layout.addWidget(QLabel("Inspector:"))
+        self.inspector_edit = QLineEdit()
+        layout.addWidget(self.inspector_edit)
+        
+        # Supervisor
+        layout.addWidget(QLabel("Supervisor de Taller:"))
+        self.supervisor_edit = QLineEdit()
+        layout.addWidget(self.supervisor_edit)
+        
+        # Fecha y hora de inicio
+        layout.addWidget(QLabel("Fecha y Hora de Inicio:"))
+        self.datetime_edit = QDateTimeEdit()
+        self.datetime_edit.setDateTime(QDateTime.currentDateTime())
+        layout.addWidget(self.datetime_edit)
+        
+        # Fecha estimada de término
+        layout.addWidget(QLabel("Fecha Estimada de Término:"))
+        self.fecha_estimada_edit = QDateTimeEdit()
+        self.fecha_estimada_edit.setDateTime(QDateTime.currentDateTime().addDays(2))
+        layout.addWidget(self.fecha_estimada_edit)
+        
+        # Botones
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | 
+                                  QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setLayout(layout)
+        
+    def load_caexs_disponibles(self):
+        """Carga CAEXs disponibles para recepción"""
+        try:
+            print("Cargando CAEXs disponibles...")
+            self.caex_combo.clear()
+            caexs = self.db_manager.get_caexs_disponibles_recepcion()
+            print(f"CAEXs encontrados: {len(caexs)}")
+            
+            if not caexs:
+                self.caex_combo.addItem("No hay CAEXs disponibles", None)
+                print("No hay CAEXs disponibles")
+                return
+                
+            for caex in caexs:
+                item_text = f"CAEX {caex.id} - {caex.modelo}"
+                self.caex_combo.addItem(item_text, caex.id)
+                print(f"Agregado CAEX {caex.id} con texto '{item_text}'")
+            
+            # Verificar que se agregaron correctamente
+            print(f"Items en combo: {self.caex_combo.count()}")
+            for i in range(self.caex_combo.count()):
+                print(f"  Item {i}: text='{self.caex_combo.itemText(i)}', data={self.caex_combo.itemData(i)}")
+                
+        except Exception as e:
+            print(f"Error en load_caexs_disponibles: {e}")
+            import traceback
+            traceback.print_exc()
+            self.caex_combo.addItem("Error al cargar CAEXs", None)
+    
+    def get_data(self):
+        """Retorna datos del formulario"""
+        try:
+            print("Obteniendo datos del formulario...")
+            
+            # Obtener fechas - manejar diferentes métodos de PyQt6
+            try:
+                fecha_inicio = self.datetime_edit.dateTime().toPython()
+            except AttributeError:
+                try:
+                    fecha_inicio = self.datetime_edit.dateTime().toPyDateTime()
+                except AttributeError:
+                    # Fallback: crear datetime manualmente
+                    dt = self.datetime_edit.dateTime()
+                    fecha_inicio = datetime(dt.date().year(), dt.date().month(), dt.date().day(),
+                                          dt.time().hour(), dt.time().minute(), dt.time().second())
+            
+            try:
+                fecha_estimada = self.fecha_estimada_edit.dateTime().toPython()
+            except AttributeError:
+                try:
+                    fecha_estimada = self.fecha_estimada_edit.dateTime().toPyDateTime()
+                except AttributeError:
+                    # Fallback: crear datetime manualmente
+                    dt = self.fecha_estimada_edit.dateTime()
+                    fecha_estimada = datetime(dt.date().year(), dt.date().month(), dt.date().day(),
+                                            dt.time().hour(), dt.time().minute(), dt.time().second())
+            
+            data = {
+                'tipo': 'RECEPCION',
+                'caex_id': self.caex_combo.currentData(),
+                'inspector': self.inspector_edit.text().strip(),
+                'supervisor': self.supervisor_edit.text().strip(),
+                'fecha_inicio': fecha_inicio,
+                'fecha_estimada': fecha_estimada
+            }
+            print(f"Datos obtenidos del formulario: {data}")
+            print(f"Inspector field text: '{self.inspector_edit.text()}'")
+            print(f"Supervisor field text: '{self.supervisor_edit.text()}'")
+            print(f"CAEX combo current text: '{self.caex_combo.currentText()}'")
+            print(f"CAEX combo current data: {self.caex_combo.currentData()}")
+            
+            return data
+        except Exception as e:
+            print(f"Error en get_data: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'tipo': 'RECEPCION',
+                'caex_id': None,
+                'inspector': '',
+                'supervisor': '',
+                'fecha_inicio': datetime.now(),
+                'fecha_estimada': datetime.now()
+            }
+
+class PreguntaCard(QFrame):
+    """Widget para mostrar una pregunta en el formulario de inspección"""
+    
+    def __init__(self, pregunta, inspeccion, db_manager, parent=None):
+        super().__init__(parent)
+        self.pregunta = pregunta
+        self.inspeccion = inspeccion
+        self.db_manager = db_manager
+        self.respuesta_actual = None
+        self.setupUI()
+        self.cargar_respuesta_existente()
+        
+    def setupUI(self):
+        self.setFrameStyle(QFrame.Shape.Box)
+        self.setStyleSheet("""
+            QFrame {
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                background-color: white;
+                margin: 5px;
+                padding: 15px;
+            }
+        """)
+        
+        layout = QVBoxLayout()
+        
+        # Número y texto de pregunta
+        header = QHBoxLayout()
+        numero = QLabel(f"Pregunta {self.pregunta.orden}")
+        numero.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        numero.setStyleSheet("color: #0078d4;")
+        
+        header.addWidget(numero)
+        header.addStretch()
+        
+        texto = QLabel(self.pregunta.texto)
+        texto.setWordWrap(True)
+        texto.setFont(QFont("Arial", 11))
+        texto.setStyleSheet("margin: 8px 0px;")
+        
+        # Opciones de respuesta
+        self.grupo_respuesta = QButtonGroup()
+        opciones_layout = QHBoxLayout()
+        
+        if self.inspeccion.tipo == 'RECEPCION':
+            self.radio_conforme = QRadioButton("Conforme")
+            self.radio_no_conforme = QRadioButton("No Conforme")
+            self.grupo_respuesta.addButton(self.radio_conforme, 0)
+            self.grupo_respuesta.addButton(self.radio_no_conforme, 1)
+            opciones_layout.addWidget(self.radio_conforme)
+            opciones_layout.addWidget(self.radio_no_conforme)
+        else:  # ENTREGA
+            self.radio_aceptado = QRadioButton("Aceptado")
+            self.radio_rechazado = QRadioButton("Rechazado")
+            self.grupo_respuesta.addButton(self.radio_aceptado, 0)
+            self.grupo_respuesta.addButton(self.radio_rechazado, 1)
+            opciones_layout.addWidget(self.radio_aceptado)
+            opciones_layout.addWidget(self.radio_rechazado)
+        
+        opciones_layout.addStretch()
+        
+        # Comentarios (solo visible si es hallazgo)
+        self.comentarios_label = QLabel("Comentarios:")
+        self.comentarios_edit = QTextEdit()
+        self.comentarios_edit.setMaximumHeight(80)
+        self.comentarios_edit.setVisible(False)
+        self.comentarios_label.setVisible(False)
+        
+        # Información SAP (solo visible si es hallazgo)
+        self.sap_group = QGroupBox("Información SAP")
+        sap_layout = QHBoxLayout()
+        
+        self.id_sap_edit = QLineEdit()
+        self.id_sap_edit.setPlaceholderText("ID SAP")
+        
+        self.tipo_aviso_radio = QRadioButton("Aviso")
+        self.tipo_ot_radio = QRadioButton("OT")
+        self.grupo_tipo_sap = QButtonGroup()
+        self.grupo_tipo_sap.addButton(self.tipo_aviso_radio, 0)
+        self.grupo_tipo_sap.addButton(self.tipo_ot_radio, 1)
+        
+        sap_layout.addWidget(QLabel("ID:"))
+        sap_layout.addWidget(self.id_sap_edit)
+        sap_layout.addWidget(QLabel("Tipo:"))
+        sap_layout.addWidget(self.tipo_aviso_radio)
+        sap_layout.addWidget(self.tipo_ot_radio)
+        
+        self.sap_group.setLayout(sap_layout)
+        self.sap_group.setVisible(False)
+        
+        # Botón de historial
+        self.historial_btn = QPushButton("Ver Historial")
+        self.historial_btn.setVisible(False)
+        self.historial_btn.clicked.connect(self.mostrar_historial)
+        
+        # Conectar señales
+        self.grupo_respuesta.buttonClicked.connect(self.on_respuesta_changed)
+        
+        # Layout final
+        layout.addLayout(header)
+        layout.addWidget(texto)
+        layout.addLayout(opciones_layout)
+        layout.addWidget(self.comentarios_label)
+        layout.addWidget(self.comentarios_edit)
+        layout.addWidget(self.sap_group)
+        layout.addWidget(self.historial_btn)
+        
+        self.setLayout(layout)
+    
+    def cargar_respuesta_existente(self):
+        """Carga respuesta existente si la hay"""
+        respuesta = self.db_manager.session.query(Respuesta).filter_by(
+            inspeccion_id=self.inspeccion.id,
+            pregunta_id=self.pregunta.id
+        ).first()
+        
+        if respuesta:
+            self.respuesta_actual = respuesta
+            
+            # Seleccionar radio button correcto
+            if respuesta.estado == 'CONFORME':
+                self.radio_conforme.setChecked(True)
+            elif respuesta.estado == 'NO_CONFORME':
+                self.radio_no_conforme.setChecked(True)
+            elif respuesta.estado == 'ACEPTADO':
+                self.radio_aceptado.setChecked(True)
+            elif respuesta.estado == 'RECHAZADO':
+                self.radio_rechazado.setChecked(True)
+            
+            # Cargar comentarios
+            self.comentarios_edit.setPlainText(respuesta.comentarios)
+            
+            # Cargar información SAP
+            if respuesta.id_aviso_orden_trabajo:
+                self.id_sap_edit.setText(respuesta.id_aviso_orden_trabajo)
+                if respuesta.tipo_accion == 'INMEDIATO':
+                    self.tipo_aviso_radio.setChecked(True)
+                else:
+                    self.tipo_ot_radio.setChecked(True)
+            
+            self.on_respuesta_changed()
+    
+    def on_respuesta_changed(self):
+        """Maneja cambio en la respuesta"""
+        button = self.grupo_respuesta.checkedButton()
+        if not button:
+            return
+            
+        es_hallazgo = False
+        if self.inspeccion.tipo == 'RECEPCION':
+            es_hallazgo = self.radio_no_conforme.isChecked()
+        else:  # ENTREGA
+            es_hallazgo = self.radio_rechazado.isChecked()
+        
+        # Mostrar/ocultar campos adicionales
+        self.comentarios_label.setVisible(es_hallazgo)
+        self.comentarios_edit.setVisible(es_hallazgo)
+        self.sap_group.setVisible(es_hallazgo)
+        self.historial_btn.setVisible(es_hallazgo)
+        
+        # Guardar respuesta automáticamente
+        self.guardar_respuesta()
+    
+    def guardar_respuesta(self):
+        """Guarda la respuesta actual"""
+        button = self.grupo_respuesta.checkedButton()
+        if not button:
+            return
+        
+        # Determinar estado
+        if self.inspeccion.tipo == 'RECEPCION':
+            estado = 'CONFORME' if self.radio_conforme.isChecked() else 'NO_CONFORME'
+        else:  # ENTREGA
+            estado = 'ACEPTADO' if self.radio_aceptado.isChecked() else 'RECHAZADO'
+        
+        # Crear o actualizar respuesta
+        if self.respuesta_actual:
+            respuesta = self.respuesta_actual
+        else:
+            respuesta = Respuesta(
+                inspeccion_id=self.inspeccion.id,
+                pregunta_id=self.pregunta.id
+            )
+            self.db_manager.session.add(respuesta)
+            self.respuesta_actual = respuesta
+        
+        respuesta.estado = estado
+        respuesta.comentarios = self.comentarios_edit.toPlainText()
+        respuesta.fecha_modificacion = datetime.now()
+        
+        # Información SAP
+        if self.id_sap_edit.text():
+            respuesta.id_aviso_orden_trabajo = self.id_sap_edit.text()
+            if self.tipo_aviso_radio.isChecked():
+                respuesta.tipo_accion = 'INMEDIATO'
+            elif self.tipo_ot_radio.isChecked():
+                respuesta.tipo_accion = 'OT'
+        
+        self.db_manager.session.commit()
+    
+    def mostrar_historial(self):
+        """Muestra historial de hallazgos para esta pregunta"""
+        historial = self.db_manager.get_historial_pregunta_caex(
+            self.pregunta.id, self.inspeccion.caex_id
+        )
+        
+        dialog = HistorialDialog(historial, self.pregunta, self)
+        dialog.exec()
+
+class HistorialDialog(QDialog):
+    """Dialog para mostrar historial de hallazgos"""
+    
+    def __init__(self, historial, pregunta, parent=None):
+        super().__init__(parent)
+        self.historial = historial
+        self.pregunta = pregunta
+        self.setupUI()
+    
+    def setupUI(self):
+        self.setWindowTitle("Historial de Hallazgos")
+        self.setModal(True)
+        self.resize(600, 400)
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        titulo = QLabel(f"Historial: {self.pregunta.texto}")
+        titulo.setWordWrap(True)
+        titulo.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        layout.addWidget(titulo)
+        
+        # Lista de historial
+        lista = QListWidget()
+        
+        if not self.historial:
+            item = QListWidgetItem("No hay hallazgos previos para esta pregunta")
+            lista.addItem(item)
+        else:
+            for respuesta in self.historial:
+                fecha = respuesta.fecha_creacion.strftime("%d/%m/%Y")
+                tipo = respuesta.inspeccion.tipo
+                estado = respuesta.estado
+                comentario = respuesta.comentarios[:50] + "..." if len(respuesta.comentarios) > 50 else respuesta.comentarios
+                
+                texto = f"{fecha} - {tipo} - {estado}\n{comentario}"
+                if respuesta.id_aviso_orden_trabajo:
+                    texto += f"\nSAP: {respuesta.id_aviso_orden_trabajo}"
+                
+                item = QListWidgetItem(texto)
+                lista.addItem(item)
+        
+        layout.addWidget(lista)
+        
+        # Botón cerrar
+        cerrar_btn = QPushButton("Cerrar")
+        cerrar_btn.clicked.connect(self.accept)
+        layout.addWidget(cerrar_btn)
+        
+        self.setLayout(layout)
+
+class FormularioInspeccionDialog(QDialog):
+    """Dialog principal para realizar inspección"""
+    
+    def __init__(self, inspeccion, db_manager, parent=None):
+        super().__init__(parent)
+        self.inspeccion = inspeccion
+        self.db_manager = db_manager
+        self.preguntas_widgets = {}
+        self.setupUI()
+        
+    def setupUI(self):
+        self.setWindowTitle(f"Inspección de {self.inspeccion.tipo} - CAEX {self.inspeccion.caex.id}")
+        self.setModal(True)
+        self.showMaximized()
+        
+        layout = QVBoxLayout()
+        
+        # Header con información de la inspección
+        header_frame = QFrame()
+        header_frame.setStyleSheet("background-color: #f0f0f0; padding: 10px; border-radius: 5px;")
+        header_layout = QHBoxLayout()
+        
+        info_text = f"CAEX {self.inspeccion.caex.id} - {self.inspeccion.caex.modelo} | "
+        info_text += f"Inspector: {self.inspeccion.nombre_inspector} | "
+        info_text += f"Supervisor: {self.inspeccion.nombre_supervisor}"
+        
+        header_label = QLabel(info_text)
+        header_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        header_layout.addWidget(header_label)
+        header_frame.setLayout(header_layout)
+        
+        # Pestañas por categoría
+        self.tab_widget = QTabWidget()
+        
+        categorias = self.db_manager.get_categorias_para_modelo(self.inspeccion.caex.modelo)
+        
+        for categoria in categorias:
+            preguntas = [p for p in categoria.preguntas 
+                        if p.modelo_aplicable in ['TODOS', self.inspeccion.caex.modelo]]
+            
+            if preguntas:
+                tab = self.crear_tab_categoria(categoria, preguntas)
+                self.tab_widget.addTab(tab, categoria.nombre)
+        
+        # Botones inferiores
+        buttons_layout = QHBoxLayout()
+        
+        self.resumen_btn = QPushButton("Ver Resumen")
+        self.resumen_btn.clicked.connect(self.mostrar_resumen)
+        
+        self.guardar_btn = QPushButton("Guardar Progreso")
+        self.guardar_btn.clicked.connect(self.guardar_progreso)
+        
+        self.finalizar_btn = QPushButton("Finalizar Inspección")
+        self.finalizar_btn.clicked.connect(self.finalizar_inspeccion)
+        
+        buttons_layout.addWidget(self.resumen_btn)
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.guardar_btn)
+        buttons_layout.addWidget(self.finalizar_btn)
+        
+        # Layout principal
+        layout.addWidget(header_frame)
+        layout.addWidget(self.tab_widget)
+        layout.addLayout(buttons_layout)
+        
+        self.setLayout(layout)
+    
+    def crear_tab_categoria(self, categoria, preguntas):
+        """Crea una pestaña para una categoría"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # Scroll area para las preguntas
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout()
+        
+        for pregunta in preguntas:
+            pregunta_widget = PreguntaCard(pregunta, self.inspeccion, self.db_manager)
+            self.preguntas_widgets[pregunta.id] = pregunta_widget
+            scroll_layout.addWidget(pregunta_widget)
+        
+        scroll_layout.addStretch()
+        scroll_widget.setLayout(scroll_layout)
+        scroll.setWidget(scroll_widget)
+        
+        layout.addWidget(scroll)
+        widget.setLayout(layout)
+        
+        return widget
+    
+    def mostrar_resumen(self):
+        """Muestra resumen de hallazgos"""
+        hallazgos = []
+        
+        for pregunta_widget in self.preguntas_widgets.values():
+            if pregunta_widget.respuesta_actual and pregunta_widget.respuesta_actual.es_hallazgo:
+                hallazgos.append(pregunta_widget.respuesta_actual)
+        
+        dialog = ResumenHallazgosDialog(hallazgos, self.inspeccion, self.db_manager, self)
+        dialog.exec()
+    
+    def guardar_progreso(self):
+        """Guarda el progreso actual"""
+        # Las respuestas ya se guardan automáticamente
+        QMessageBox.information(self, "Guardado", "Progreso guardado correctamente")
+    
+    def finalizar_inspeccion(self):
+        """Finaliza la inspección"""
+        # Verificar que todas las preguntas estén respondidas
+        preguntas_sin_responder = []
+        
+        for pregunta_widget in self.preguntas_widgets.values():
+            if not pregunta_widget.grupo_respuesta.checkedButton():
+                preguntas_sin_responder.append(pregunta_widget.pregunta.texto)
+        
+        if preguntas_sin_responder:
+            QMessageBox.warning(self, "Preguntas Sin Responder", 
+                              f"Las siguientes preguntas no han sido respondidas:\n\n" + 
+                              "\n".join(preguntas_sin_responder[:5]) + 
+                              (f"\n... y {len(preguntas_sin_responder) - 5} más" if len(preguntas_sin_responder) > 5 else ""))
+            return
+        
+        # Mostrar resumen final
+        self.mostrar_resumen()
+
+class ResumenHallazgosDialog(QDialog):
+    """Dialog para mostrar resumen de hallazgos y finalizar inspección"""
+    
+    def __init__(self, hallazgos, inspeccion, db_manager, parent=None):
+        super().__init__(parent)
+        self.hallazgos = hallazgos
+        self.inspeccion = inspeccion
+        self.db_manager = db_manager
+        self.setupUI()
+    
+    def setupUI(self):
+        self.setWindowTitle("Resumen de Hallazgos")
+        self.setModal(True)
+        self.resize(800, 600)
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        titulo = QLabel(f"Resumen de Inspección de {self.inspeccion.tipo} - CAEX {self.inspeccion.caex.id}")
+        titulo.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(titulo)
+        
+        # Estadísticas
+        total_respuestas = len(self.db_manager.session.query(Respuesta).filter_by(
+            inspeccion_id=self.inspeccion.id).all())
+        total_hallazgos = len(self.hallazgos)
+        
+        stats = QLabel(f"Total preguntas: {total_respuestas} | Hallazgos: {total_hallazgos}")
+        stats.setFont(QFont("Arial", 11))
+        layout.addWidget(stats)
+        
+        # Lista de hallazgos
+        if self.hallazgos:
+            hallazgos_label = QLabel("Hallazgos encontrados:")
+            hallazgos_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+            layout.addWidget(hallazgos_label)
+            
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            
+            scroll_widget = QWidget()
+            scroll_layout = QVBoxLayout()
+            
+            for hallazgo in self.hallazgos:
+                frame = self.crear_hallazgo_widget(hallazgo)
+                scroll_layout.addWidget(frame)
+            
+            scroll_layout.addStretch()
+            scroll_widget.setLayout(scroll_layout)
+            scroll.setWidget(scroll_widget)
+            layout.addWidget(scroll)
+        else:
+            no_hallazgos = QLabel("✅ No se encontraron hallazgos - Inspección completada satisfactoriamente")
+            no_hallazgos.setStyleSheet("color: green; font-size: 14px; font-weight: bold; padding: 20px;")
+            no_hallazgos.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(no_hallazgos)
+        
+        # Comentarios generales
+        layout.addWidget(QLabel("Comentarios Generales:"))
+        self.comentarios_edit = QTextEdit()
+        self.comentarios_edit.setMaximumHeight(100)
+        self.comentarios_edit.setPlainText(self.inspeccion.comentarios_generales)
+        layout.addWidget(self.comentarios_edit)
+        
+        # Botones
+        buttons_layout = QHBoxLayout()
+        
+        self.pdf_btn = QPushButton("Generar PDF")
+        self.pdf_btn.clicked.connect(self.generar_pdf)
+        
+        self.finalizar_btn = QPushButton("Finalizar Inspección")
+        self.finalizar_btn.clicked.connect(self.finalizar_inspeccion)
+        
+        cerrar_btn = QPushButton("Cerrar")
+        cerrar_btn.clicked.connect(self.reject)
+        
+        buttons_layout.addWidget(self.pdf_btn)
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(cerrar_btn)
+        buttons_layout.addWidget(self.finalizar_btn)
+        
+        layout.addLayout(buttons_layout)
+        self.setLayout(layout)
+    
+    def crear_hallazgo_widget(self, hallazgo):
+        """Crea widget para mostrar un hallazgo"""
+        frame = QFrame()
+        frame.setFrameStyle(QFrame.Shape.Box)
+        frame.setStyleSheet("border: 1px solid #ddd; border-radius: 5px; padding: 10px; margin: 5px;")
+        
+        layout = QVBoxLayout()
+        
+        # Categoría y estado
+        header = QHBoxLayout()
+        categoria = QLabel(hallazgo.pregunta.categoria.nombre)
+        categoria.setStyleSheet("color: #0078d4; font-weight: bold;")
+        
+        estado = QLabel(hallazgo.estado)
+        color = "#ff6b6b" if hallazgo.estado in ['NO_CONFORME', 'RECHAZADO'] else "#4ecdc4"
+        estado.setStyleSheet(f"color: {color}; font-weight: bold;")
+        
+        header.addWidget(categoria)
+        header.addStretch()
+        header.addWidget(estado)
+        
+        # Pregunta
+        pregunta = QLabel(hallazgo.pregunta.texto)
+        pregunta.setWordWrap(True)
+        pregunta.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        
+        # Comentarios
+        if hallazgo.comentarios:
+            comentarios = QLabel(f"Comentarios: {hallazgo.comentarios}")
+            comentarios.setWordWrap(True)
+            comentarios.setStyleSheet("font-style: italic; color: #666;")
+        
+        # Información SAP
+        sap_info = None
+        if hallazgo.id_aviso_orden_trabajo:
+            sap_info = QLabel(f"SAP: {hallazgo.id_aviso_orden_trabajo} ({hallazgo.tipo_accion})")
+            sap_info.setStyleSheet("color: #0078d4; font-weight: bold;")
+        
+        layout.addLayout(header)
+        layout.addWidget(pregunta)
+        if hallazgo.comentarios:
+            layout.addWidget(comentarios)
+        if sap_info:
+            layout.addWidget(sap_info)
+        
+        frame.setLayout(layout)
+        return frame
+    
+    def generar_pdf(self):
+        """Genera PDF del resumen"""
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Guardar PDF", 
+            f"Resumen_Inspeccion_{self.inspeccion.caex.id}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            "PDF Files (*.pdf)"
+        )
+        
+        if filename:
+            try:
+                self.crear_pdf(filename)
+                QMessageBox.information(self, "PDF Generado", f"PDF guardado en:\n{filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error al generar PDF:\n{str(e)}")
+    
+    def crear_pdf(self, filename):
+        """Crea el archivo PDF"""
+        c = canvas.Canvas(filename, pagesize=letter)
+        width, height = letter
+        
+        # Título
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(50, height - 50, f"Resumen de Inspección de {self.inspeccion.tipo}")
+        
+        # Información básica
+        c.setFont("Helvetica", 12)
+        y = height - 80
+        
+        info_lines = [
+            f"CAEX: {self.inspeccion.caex.id} - Modelo: {self.inspeccion.caex.modelo}",
+            f"Inspector: {self.inspeccion.nombre_inspector}",
+            f"Supervisor: {self.inspeccion.nombre_supervisor}",
+            f"Fecha: {self.inspeccion.fecha_creacion.strftime('%d/%m/%Y %H:%M')}",
+            f"Fecha de generación: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        ]
+        
+        for line in info_lines:
+            c.drawString(50, y, line)
+            y -= 20
+        
+        # Estadísticas
+        y -= 20
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(50, y, f"Total de hallazgos: {len(self.hallazgos)}")
+        y -= 30
+        
+        # Hallazgos
+        if self.hallazgos:
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(50, y, "Detalle de Hallazgos:")
+            y -= 20
+            
+            for i, hallazgo in enumerate(self.hallazgos, 1):
+                if y < 100:  # Nueva página si es necesario
+                    c.showPage()
+                    y = height - 50
+                
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(50, y, f"{i}. {hallazgo.pregunta.categoria.nombre}")
+                y -= 15
+                
+                c.setFont("Helvetica", 9)
+                # Dividir texto largo en líneas
+                texto = hallazgo.pregunta.texto
+                lines = [texto[i:i+80] for i in range(0, len(texto), 80)]
+                for line in lines:
+                    c.drawString(70, y, line)
+                    y -= 12
+                
+                c.drawString(70, y, f"Estado: {hallazgo.estado}")
+                y -= 12
+                
+                if hallazgo.comentarios:
+                    c.drawString(70, y, f"Comentarios: {hallazgo.comentarios}")
+                    y -= 12
+                
+                y -= 10
+        else:
+            c.setFont("Helvetica", 12)
+            c.drawString(50, y, "✓ No se encontraron hallazgos - Inspección completada satisfactoriamente")
+        
+        c.save()
+    
+    def finalizar_inspeccion(self):
+        """Finaliza la inspección"""
+        self.inspeccion.estado = 'CERRADA'
+        self.inspeccion.fecha_finalizacion = datetime.now()
+        self.inspeccion.comentarios_generales = self.comentarios_edit.toPlainText()
+        
+        self.db_manager.session.commit()
+        
+        QMessageBox.information(self, "Inspección Finalizada", 
+                              "La inspección ha sido finalizada correctamente")
+        self.accept()
+
+# =========================== PESTAÑAS PRINCIPALES ===========================
+class CAEXTab(QWidget):
+    """Pestaña de CAEXs con historial"""
+    
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.setupUI()
+        
+    def setupUI(self):
+        layout = QVBoxLayout()
+        
+        # Header
+        header = QHBoxLayout()
+        title = QLabel("Historial de CAEXs")
+        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        
+        export_btn = QPushButton("Exportar ZIP")
+        export_btn.clicked.connect(self.exportar_zip)
+        export_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+        """)
+        
+        import_btn = QPushButton("Importar ZIP")
+        import_btn.clicked.connect(self.importar_zip)
+        import_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+        """)
+        
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(export_btn)
+        header.addWidget(import_btn)
+        
+        # Área de scroll
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        
+        self.caex_widget = QWidget()
+        self.caex_layout = QGridLayout()
+        self.caex_widget.setLayout(self.caex_layout)
+        self.scroll.setWidget(self.caex_widget)
+        
+        layout.addLayout(header)
+        layout.addWidget(self.scroll)
+        self.setLayout(layout)
+        
+        self.refresh_data()
+    
+    def refresh_data(self):
+        """Actualiza las tarjetas de CAEX"""
+        # Limpiar layout
+        for i in reversed(range(self.caex_layout.count())):
+            child = self.caex_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+        
+        # Obtener todos los CAEXs
+        caexs = self.db_manager.session.query(CAEX).order_by(CAEX.id).all()
+        
+        # Mostrar en grid de 4 columnas
+        for i, caex in enumerate(caexs):
+            card = CAEXCard(caex)
+            card.clicked.connect(self.on_caex_clicked)
+            row = i // 4
+            col = i % 4
+            self.caex_layout.addWidget(card, row, col)
+    
+    def exportar_zip(self):
+        """Exporta datos a archivo ZIP"""
+        # Generar nombre por defecto
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H%M%S")
+        nombre_default = f"CAEX_Backup_{timestamp}.zip"
+        
+        archivo, _ = QFileDialog.getSaveFileName(
+            self, "Guardar respaldo", 
+            nombre_default, "Archivos ZIP (*.zip)"
+        )
+        
+        if archivo:
+            try:
+                resultado = self.crear_zip_exportacion(archivo)
+                if resultado:
+                    QMessageBox.information(self, "Exportación Exitosa", 
+                                          f"Respaldo guardado en:\n{archivo}")
+                else:
+                    QMessageBox.warning(self, "Error", "Error al crear el respaldo")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error durante la exportación:\n{str(e)}")
+    
+    def crear_zip_exportacion(self, archivo_zip):
+        """Crea el archivo ZIP de exportación"""
+        # Crear directorio temporal
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Crear metadata.json
+            metadata = {
+                "version": 1,
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "appVersion": "1.0",
+                "deviceInfo": {
+                    "manufacturer": "PC",
+                    "model": "Desktop",
+                    "pythonVersion": sys.version.split()[0]
+                }
+            }
+            
+            metadata_path = os.path.join(temp_dir, 'metadata.json')
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            
+            # Crear database.json
+            database_data = self.generar_database_json()
+            database_path = os.path.join(temp_dir, 'database.json')
+            with open(database_path, 'w', encoding='utf-8') as f:
+                json.dump(database_data, f, indent=2, ensure_ascii=False)
+            
+            # Crear ZIP
+            with zipfile.ZipFile(archivo_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                zipf.write(metadata_path, 'metadata.json')
+                zipf.write(database_path, 'database.json')
+            
+            return True
+    
+    def generar_database_json(self):
+        """Genera el JSON con todos los datos de la base de datos"""
+        data = {
+            "caex": [],
+            "categorias": [],
+            "preguntas": [],
+            "inspecciones": [],
+            "respuestas": [],
+            "fotos": []
+        }
+        
+        # Exportar CAEXs
+        caexs = self.db_manager.session.query(CAEX).all()
+        caex_mapping = {}  # Para mapear IDs reales a IDs secuenciales
+        
+        for i, caex in enumerate(caexs, 1):
+            caex_mapping[caex.id] = i
+            data["caex"].append({
+                "caexId": i,
+                "numeroIdentificador": caex.id,
+                "modelo": caex.modelo,
+                "fechaRegistro": int(caex.fecha_registro.timestamp() * 1000)
+            })
+        
+        # Exportar Categorías
+        categorias = self.db_manager.session.query(Categoria).order_by(Categoria.orden).all()
+        for categoria in categorias:
+            data["categorias"].append({
+                "categoriaId": categoria.id,
+                "nombre": categoria.nombre,
+                "orden": categoria.orden,
+                "modeloAplicable": categoria.modelo_aplicable,
+                "fechaCreacion": int(categoria.fecha_creacion.timestamp() * 1000)
+            })
+        
+        # Exportar Preguntas
+        preguntas = self.db_manager.session.query(Pregunta).order_by(Pregunta.categoria_id, Pregunta.orden).all()
+        for pregunta in preguntas:
+            data["preguntas"].append({
+                "preguntaId": pregunta.id,
+                "texto": pregunta.texto,
+                "categoriaId": pregunta.categoria_id,
+                "orden": pregunta.orden,
+                "modeloAplicable": pregunta.modelo_aplicable,
+                "fechaCreacion": int(pregunta.fecha_creacion.timestamp() * 1000)
+            })
+        
+        # Exportar Inspecciones
+        inspecciones = self.db_manager.session.query(Inspeccion).order_by(Inspeccion.fecha_creacion).all()
+        inspeccion_mapping = {}
+        
+        for i, inspeccion in enumerate(inspecciones, 1):
+            inspeccion_mapping[inspeccion.id] = i
+            caex_id_exportacion = caex_mapping.get(inspeccion.caex_id)
+            
+            data["inspecciones"].append({
+                "inspeccionId": i,
+                "caexId": caex_id_exportacion,
+                "tipo": inspeccion.tipo,
+                "estado": inspeccion.estado,
+                "nombreInspector": inspeccion.nombre_inspector,
+                "nombreSupervisor": inspeccion.nombre_supervisor,
+                "inspeccionRecepcionId": inspeccion_mapping.get(inspeccion.inspeccion_recepcion_id) if inspeccion.inspeccion_recepcion_id else None,
+                "fechaCreacion": int(inspeccion.fecha_creacion.timestamp() * 1000),
+                "fechaFinalizacion": int(inspeccion.fecha_finalizacion.timestamp() * 1000) if inspeccion.fecha_finalizacion else None,
+                "comentariosGenerales": inspeccion.comentarios_generales or "",
+                "fechaTerminoEstimada": int(inspeccion.fecha_termino_estimada.timestamp() * 1000) if inspeccion.fecha_termino_estimada else None
+            })
+        
+        # Exportar Respuestas
+        respuestas = self.db_manager.session.query(Respuesta).order_by(Respuesta.fecha_creacion).all()
+        respuesta_mapping = {}
+        
+        for i, respuesta in enumerate(respuestas, 1):
+            respuesta_mapping[respuesta.id] = i
+            inspeccion_id_exportacion = inspeccion_mapping.get(respuesta.inspeccion_id)
+            
+            data["respuestas"].append({
+                "respuestaId": i,
+                "inspeccionId": inspeccion_id_exportacion,
+                "preguntaId": respuesta.pregunta_id,
+                "estado": respuesta.estado,
+                "comentarios": respuesta.comentarios or "",
+                "tipoAccion": respuesta.tipo_accion,
+                "idAvisoOrdenTrabajo": respuesta.id_aviso_orden_trabajo,
+                "fechaCreacion": int(respuesta.fecha_creacion.timestamp() * 1000),
+                "fechaModificacion": int(respuesta.fecha_modificacion.timestamp() * 1000)
+            })
+        
+        # Exportar Fotos (solo referencias, sin archivos físicos)
+        fotos = self.db_manager.session.query(Foto).order_by(Foto.fecha_creacion).all()
+        for i, foto in enumerate(fotos, 1):
+            respuesta_id_exportacion = respuesta_mapping.get(foto.respuesta_id)
+            
+            data["fotos"].append({
+                "fotoId": i,
+                "respuestaId": respuesta_id_exportacion,
+                "rutaArchivo": foto.ruta_archivo,
+                "descripcion": foto.descripcion or "",
+                "fechaCreacion": int(foto.fecha_creacion.timestamp() * 1000)
+            })
+        
+        return data
+
+    def importar_zip(self):
+        """Importa datos desde archivo ZIP"""
+        archivo, _ = QFileDialog.getOpenFileName(
+            self, "Seleccionar archivo de respaldo", 
+            "", "Archivos ZIP (*.zip)"
+        )
+        
+        if archivo:
+            try:
+                resultado = self.procesar_importacion(archivo)
+                if resultado:
+                    QMessageBox.information(self, "Importación Exitosa", 
+                                          "Datos importados correctamente")
+                    self.refresh_data()
+                else:
+                    QMessageBox.warning(self, "Error", "Error al importar datos")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error durante la importación:\n{str(e)}")
+    
+    def procesar_importacion(self, archivo_zip):
+        """Procesa la importación del archivo ZIP"""
+        import tempfile
+        
+        # Crear directorio temporal
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Extraer ZIP
+            with zipfile.ZipFile(archivo_zip, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+            
+            # Buscar database.json
+            database_json = os.path.join(temp_dir, 'database.json')
+            if not os.path.exists(database_json):
+                raise Exception("No se encontró database.json en el archivo")
+            
+            # Cargar datos JSON
+            with open(database_json, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Importar datos (sin reemplazar, solo agregar nuevos)
+            self.importar_datos_json(data)
+            
+            return True
+    
+    def importar_datos_json(self, data):
+        """Importa datos desde JSON sin duplicar"""
+        # Importar CAEXs (si no existen)
+        for caex_data in data.get('caex', []):
+            caex_id = caex_data['numeroIdentificador']
+            if not self.db_manager.session.query(CAEX).filter_by(id=caex_id).first():
+                caex = CAEX(id=caex_id, modelo=caex_data['modelo'])
+                self.db_manager.session.add(caex)
+        
+        # Importar inspecciones
+        for insp_data in data.get('inspecciones', []):
+            # Verificar si ya existe una inspección similar
+            caex_id = None
+            for caex_data in data.get('caex', []):
+                if caex_data['caexId'] == insp_data['caexId']:
+                    caex_id = caex_data['numeroIdentificador']
+                    break
+            
+            if caex_id:
+                # Buscar si ya existe inspección similar
+                existing = self.db_manager.session.query(Inspeccion).filter_by(
+                    caex_id=caex_id,
+                    tipo=insp_data['tipo'],
+                    nombre_inspector=insp_data['nombreInspector']
+                ).first()
+                
+                if not existing:
+                    inspeccion = Inspeccion(
+                        caex_id=caex_id,
+                        tipo=insp_data['tipo'],
+                        estado=insp_data['estado'],
+                        nombre_inspector=insp_data['nombreInspector'],
+                        nombre_supervisor=insp_data['nombreSupervisor'],
+                        fecha_creacion=datetime.fromtimestamp(insp_data['fechaCreacion'] / 1000),
+                        fecha_finalizacion=datetime.fromtimestamp(insp_data['fechaFinalizacion'] / 1000) if insp_data.get('fechaFinalizacion') else None,
+                        comentarios_generales=insp_data.get('comentariosGenerales', ''),
+                        fecha_termino_estimada=datetime.fromtimestamp(insp_data['fechaTerminoEstimada'] / 1000) if insp_data.get('fechaTerminoEstimada') else None
+                    )
+                    self.db_manager.session.add(inspeccion)
+                    self.db_manager.session.flush()  # Para obtener el ID
+                    
+                    # Importar respuestas de esta inspección
+                    for resp_data in data.get('respuestas', []):
+                        if resp_data['inspeccionId'] == insp_data['inspeccionId']:
+                            respuesta = Respuesta(
+                                inspeccion_id=inspeccion.id,
+                                pregunta_id=resp_data['preguntaId'],
+                                estado=resp_data['estado'],
+                                comentarios=resp_data.get('comentarios', ''),
+                                tipo_accion=resp_data.get('tipoAccion'),
+                                id_aviso_orden_trabajo=resp_data.get('idAvisoOrdenTrabajo'),
+                                fecha_creacion=datetime.fromtimestamp(resp_data['fechaCreacion'] / 1000),
+                                fecha_modificacion=datetime.fromtimestamp(resp_data['fechaModificacion'] / 1000)
+                            )
+                            self.db_manager.session.add(respuesta)
+        
+        self.db_manager.session.commit()
+    
+    def on_caex_clicked(self, caex):
+        """Maneja click en tarjeta CAEX"""
+        QMessageBox.information(self, "CAEX Info", 
+                              f"CAEX {caex.id} - {caex.modelo}\n"
+                              f"Estado: {caex.estado_actual}\n"
+                              f"Conformidad: {caex.porcentaje_conformidad:.1f}%")
+
+class InspeccionesTab(QWidget):
+    """Pestaña de inspecciones abiertas"""
+    
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.setupUI()
+        
+    def setupUI(self):
+        layout = QVBoxLayout()
+        
+        # Header con botón para nueva inspección
+        header = QHBoxLayout()
+        title = QLabel("Inspecciones")
+        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        
+        nueva_btn = QPushButton("Nueva Inspección")
+        nueva_btn.clicked.connect(self.nueva_inspeccion)
+        nueva_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+        """)
+        
+        refresh_btn = QPushButton("Actualizar")
+        refresh_btn.clicked.connect(self.refresh_data)
+        
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(refresh_btn)
+        header.addWidget(nueva_btn)
+        
+        # Área de scroll para las inspecciones
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        
+        self.inspecciones_widget = QWidget()
+        self.inspecciones_layout = QVBoxLayout()
+        self.inspecciones_widget.setLayout(self.inspecciones_layout)
+        self.scroll.setWidget(self.inspecciones_widget)
+        
+        layout.addLayout(header)
+        layout.addWidget(self.scroll)
+        self.setLayout(layout)
+        
+        self.refresh_data()
+    
+    def refresh_data(self):
+        """Actualiza la lista de inspecciones"""
+        # Limpiar layout
+        for i in reversed(range(self.inspecciones_layout.count())):
+            child = self.inspecciones_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+        
+        # Obtener inspecciones abiertas
+        inspecciones_abiertas = self.db_manager.get_inspecciones_abiertas()
+        
+        # Obtener CAEXs pendientes de entrega
+        caexs_pendientes = self.db_manager.get_caexs_disponibles_entrega()
+        
+        if not inspecciones_abiertas and not caexs_pendientes:
+            no_data = QLabel("No hay inspecciones abiertas ni pendientes de entrega")
+            no_data.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            no_data.setStyleSheet("color: #333333; font-size: 14px; padding: 20px; background-color: transparent;")
+            self.inspecciones_layout.addWidget(no_data)
+            return
+        
+        # Mostrar inspecciones abiertas
+        if inspecciones_abiertas:
+            titulo_abiertas = QLabel("Inspecciones Abiertas")
+            titulo_abiertas.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+            titulo_abiertas.setStyleSheet("color: #ff6b6b; margin: 10px 0; background-color: transparent;")
+            self.inspecciones_layout.addWidget(titulo_abiertas)
+            
+            for inspeccion in inspecciones_abiertas:
+                card = self.create_inspeccion_card(inspeccion)
+                self.inspecciones_layout.addWidget(card)
+        
+        # Mostrar pendientes de entrega
+        if caexs_pendientes:
+            titulo_pendientes = QLabel("Pendientes de Entrega")
+            titulo_pendientes.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+            titulo_pendientes.setStyleSheet("color: #ffa500; margin: 10px 0; background-color: transparent;")
+            self.inspecciones_layout.addWidget(titulo_pendientes)
+            
+            for caex in caexs_pendientes:
+                # Buscar inspección de recepción cerrada
+                inspeccion_recepcion = next(
+                    (i for i in caex.inspecciones if i.tipo == 'RECEPCION' and i.estado == 'CERRADA'),
+                    None
+                )
+                if inspeccion_recepcion:
+                    card = self.create_pendiente_card(caex, inspeccion_recepcion)
+                    self.inspecciones_layout.addWidget(card)
+        
+        self.inspecciones_layout.addStretch()
+    
+    def create_inspeccion_card(self, inspeccion):
+        """Crea tarjeta para una inspección abierta"""
+        frame = QFrame()
+        frame.setFrameStyle(QFrame.Shape.Box)
+        frame.setStyleSheet("""
+            QFrame {
+                border: 2px solid #ff6b6b;
+                border-radius: 8px;
+                background-color: white;
+                margin: 5px;
+                padding: 15px;
+            }
+            QLabel {
+                color: #333333;
+                background-color: transparent;
+            }
+        """)
+        
+        layout = QHBoxLayout()
+        
+        # Info principal
+        info_layout = QVBoxLayout()
+        
+        header = QLabel(f"CAEX {inspeccion.caex.id} - Inspección de {inspeccion.tipo}")
+        header.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        header.setStyleSheet("color: #000000; background-color: transparent;")
+        
+        detalles = QLabel(f"Inspector: {inspeccion.nombre_inspector} | Supervisor: {inspeccion.nombre_supervisor}")
+        detalles.setStyleSheet("color: #555555; background-color: transparent;")
+        
+        fecha = QLabel(f"Inicio: {inspeccion.fecha_creacion.strftime('%d/%m/%Y %H:%M')}")
+        fecha.setStyleSheet("color: #555555; background-color: transparent;")
+        
+        info_layout.addWidget(header)
+        info_layout.addWidget(detalles)
+        info_layout.addWidget(fecha)
+        
+        # Botón continuar
+        continuar_btn = QPushButton("Continuar Inspección")
+        continuar_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+        """)
+        continuar_btn.clicked.connect(lambda: self.continuar_inspeccion(inspeccion))
+        
+        layout.addLayout(info_layout, 3)
+        layout.addWidget(continuar_btn)
+        
+        frame.setLayout(layout)
+        return frame
+    
+    def create_pendiente_card(self, caex, inspeccion_recepcion):
+        """Crea tarjeta para CAEX pendiente de entrega"""
+        frame = QFrame()
+        frame.setFrameStyle(QFrame.Shape.Box)
+        frame.setStyleSheet("""
+            QFrame {
+                border: 2px solid #ffa500;
+                border-radius: 8px;
+                background-color: white;
+                margin: 5px;
+                padding: 15px;
+            }
+            QLabel {
+                color: #333333;
+                background-color: transparent;
+            }
+        """)
+        
+        layout = QHBoxLayout()
+        
+        # Info principal
+        info_layout = QVBoxLayout()
+        
+        header = QLabel(f"CAEX {caex.id} - Pendiente de Entrega")
+        header.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        header.setStyleSheet("color: #000000; background-color: transparent;")
+        
+        detalles = QLabel(f"Recepción completada: {inspeccion_recepcion.fecha_finalizacion.strftime('%d/%m/%Y %H:%M')}")
+        detalles.setStyleSheet("color: #555555; background-color: transparent;")
+        
+        # Contar hallazgos
+        hallazgos = [r for r in inspeccion_recepcion.respuestas if r.es_hallazgo]
+        hallazgos_text = QLabel(f"Hallazgos en recepción: {len(hallazgos)}")
+        hallazgos_text.setStyleSheet("color: #555555; background-color: transparent;")
+        
+        info_layout.addWidget(header)
+        info_layout.addWidget(detalles)
+        info_layout.addWidget(hallazgos_text)
+        
+        # Botón crear entrega
+        entrega_btn = QPushButton("Crear Inspección de Entrega")
+        entrega_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+        """)
+        entrega_btn.clicked.connect(lambda: self.crear_entrega(caex))
+        
+        layout.addLayout(info_layout, 3)
+        layout.addWidget(entrega_btn)
+        
+        frame.setLayout(layout)
+        return frame
+    
+    def nueva_inspeccion(self):
+        """Abre dialog para nueva inspección"""
+        try:
+            print("Abriendo dialog de nueva inspección...")
+            dialog = NuevaInspeccionDialog(self.db_manager, self)
+            print("Dialog creado correctamente")
+            
+            # El dialog ya maneja su propia validación en on_accept
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                print("Usuario aceptó el dialog")
+                data = dialog.get_data()
+                print(f"Datos obtenidos: {data}")
+                
+                # Solo verificar que tenemos datos válidos
+                if data.get('caex_id') and data.get('inspector') and data.get('supervisor'):
+                    print("Datos válidos, creando inspección...")
+                    self.crear_inspeccion(data)
+                    print("Inspección creada, actualizando datos...")
+                    self.refresh_data()
+                    print("Datos actualizados")
+                else:
+                    print("Datos inválidos recibidos del dialog")
+                    QMessageBox.warning(self, "Error", "Error en los datos del formulario")
+            else:
+                print("Usuario canceló el dialog")
+                
+        except Exception as e:
+            print(f"Error en nueva_inspeccion: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Error al crear nueva inspección:\n{str(e)}")
+    
+    def validar_datos(self, data):
+        """Valida datos del formulario - versión simplificada"""
+        try:
+            print(f"Validando datos: {data}")
+            
+            # Validación simple ya que el dialog ya validó
+            if not data.get('caex_id'):
+                return False
+            if not data.get('inspector', '').strip():
+                return False
+            if not data.get('supervisor', '').strip():
+                return False
+            
+            print("Validación exitosa")
+            return True
+            
+        except Exception as e:
+            print(f"Error en validar_datos: {e}")
+            return False
+    
+    def crear_inspeccion(self, data):
+        """Crea nueva inspección en la base de datos"""
+        try:
+            print(f"Creando inspección con datos: {data}")
+            
+            # Verificar que tenemos todos los datos necesarios
+            if not data.get('caex_id'):
+                raise ValueError("ID de CAEX es requerido")
+            if not data.get('inspector'):
+                raise ValueError("Nombre de inspector es requerido")
+            if not data.get('supervisor'):
+                raise ValueError("Nombre de supervisor es requerido")
+            
+            inspeccion = Inspeccion(
+                caex_id=data['caex_id'],
+                tipo=data['tipo'],
+                nombre_inspector=data['inspector'],
+                nombre_supervisor=data['supervisor'],
+                fecha_creacion=data.get('fecha_inicio', datetime.now()),
+                fecha_termino_estimada=data.get('fecha_estimada')
+            )
+            
+            print("Objeto Inspeccion creado")
+            
+            # Si es entrega, buscar inspección de recepción
+            if data['tipo'] == 'ENTREGA':
+                print("Buscando inspección de recepción asociada...")
+                inspeccion_recepcion = self.db_manager.session.query(Inspeccion).filter_by(
+                    caex_id=data['caex_id'],
+                    tipo='RECEPCION',
+                    estado='CERRADA'
+                ).first()
+                if inspeccion_recepcion:
+                    inspeccion.inspeccion_recepcion_id = inspeccion_recepcion.id
+                    print(f"Asociada con recepción ID: {inspeccion_recepcion.id}")
+            
+            print("Añadiendo a la sesión...")
+            self.db_manager.session.add(inspeccion)
+            print("Haciendo commit...")
+            self.db_manager.session.commit()
+            print("Commit exitoso")
+            
+            QMessageBox.information(self, "Éxito", f"Inspección de {data['tipo'].lower()} creada correctamente")
+            
+        except Exception as e:
+            print(f"Error en crear_inspeccion: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            try:
+                self.db_manager.session.rollback()
+                print("Rollback realizado")
+            except:
+                print("Error en rollback")
+                
+            QMessageBox.critical(self, "Error", f"Error al crear la inspección:\n{str(e)}")
+    
+    def continuar_inspeccion(self, inspeccion):
+        """Continúa una inspección existente"""
+        dialog = FormularioInspeccionDialog(inspeccion, self.db_manager, self)
+        dialog.exec()
+        self.refresh_data()
+    
+    def crear_entrega(self, caex):
+        """Crea inspección de entrega para un CAEX"""
+        dialog = NuevaEntregaDialog(caex, self.db_manager, self)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            data = dialog.get_data()
+            if self.validar_datos(data):
+                self.crear_inspeccion(data)
+                self.refresh_data()
+
+# =========================== VENTANA PRINCIPAL ===========================
+class MainWindow(QMainWindow):
+    """Ventana principal de la aplicación"""
+    
+    def __init__(self):
+        super().__init__()
+        try:
+            self.db_manager = DatabaseManager()
+            self.setupUI()
+        except Exception as e:
+            QMessageBox.critical(None, "Error de Base de Datos", 
+                               f"Error al inicializar la base de datos:\n{str(e)}")
+            sys.exit(1)
+        
+    def setupUI(self):
+        self.setWindowTitle("Sistema de Inspecciones CAEX v1.0")
+        self.setGeometry(100, 100, 1400, 900)
+        
+        # Widget central con pestañas
+        central_widget = QTabWidget()
+        
+        # Crear pestañas
+        self.caex_tab = CAEXTab(self.db_manager)
+        self.inspecciones_tab = InspeccionesTab(self.db_manager)
+        
+        central_widget.addTab(self.caex_tab, "CAEXs")
+        central_widget.addTab(self.inspecciones_tab, "Inspecciones")
+        
+        self.setCentralWidget(central_widget)
+        
+        # Estilo general más simple y claro
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f5f5;
+            }
+            QTabWidget::pane {
+                border: 1px solid #cccccc;
+                background-color: white;
+            }
+            QTabBar::tab {
+                background-color: #e8e8e8;
+                color: #000000;
+                padding: 12px 20px;
+                margin-right: 2px;
+                font-size: 12px;
+                font-weight: bold;
+                border: 1px solid #cccccc;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                color: #000000;
+                border-bottom: 2px solid #0078d4;
+            }
+            QTabBar::tab:hover {
+                background-color: #f0f0f0;
+                color: #000000;
+            }
+            QLabel {
+                color: #333333;
+            }
+            QScrollArea {
+                background-color: #f9f9f9;
+            }
+        """)
+        
+        # Configurar auto-refresh cada 30 segundos
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.auto_refresh)
+        self.timer.start(30000)  # 30 segundos
+    
+    def auto_refresh(self):
+        """Actualiza automáticamente las pestañas"""
+        try:
+            self.caex_tab.refresh_data()
+            self.inspecciones_tab.refresh_data()
+        except Exception as e:
+            print(f"Error en auto-refresh: {e}")
+    
+    def closeEvent(self, event):
+        """Maneja el cierre de la aplicación"""
+        try:
+            self.db_manager.close()
+        except:
+            pass
+        event.accept()
+
+# =========================== FUNCIÓN PRINCIPAL ===========================
+def main():
+    app = QApplication(sys.argv)
+    
+    # Configurar estilo de la aplicación
+    app.setStyle('Fusion')
+    
+    try:
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec())
+    except Exception as e:
+        QMessageBox.critical(None, "Error Fatal", 
+                           f"Error al iniciar la aplicación:\n{str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
